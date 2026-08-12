@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import os,re,sys,time,random,requests
+import os,re,sys,time,random,requests,json,datetime,urllib.request
 from playwright.sync_api import sync_playwright
 
 # --- 环境变量 ---
@@ -10,6 +10,7 @@ EMAIL        = os.environ.get('EMAIL') or ""           # 登录邮箱,可选，�
 PASSWORD     = os.environ.get('PASSWORD') or ""        # 登录密码,可选，作为备用
 TG_BOT_TOKEN = os.environ.get('TG_BOT_TOKEN') or ""    # Telegram Bot Token,可选
 TG_CHAT_ID   = os.environ.get('TG_CHAT_ID') or ""      # Telegram Chat ID,可选
+CRON_JOB     = os.environ.get('CRON_JOB') or ""       # Cron-Job.org: API_KEY,JOB_ID
 
 BASE_URL = "https://dash.hidencloud.com"
 LOGIN_URL = f"{BASE_URL}/auth/login"
@@ -84,6 +85,57 @@ def send_telegram_notification(status, old_due, new_due):
     except Exception as e:
         log(f"❌ Telegram 通知异常: {e}")
         return False
+
+def update_cronjob_schedule(days=7):
+    """将 Cron-Job.org 下一次执行时间设置为当前北京时间 + 指定天数"""
+    if not CRON_JOB or "," not in CRON_JOB:
+        log("⚠️ 未配置 CRON_JOB，跳过写回调度")
+        return False
+
+    try:
+        api_key, job_id = [x.strip() for x in CRON_JOB.split(",", 1)]
+        bj_now = datetime.datetime.utcnow() + datetime.timedelta(hours=8)
+        next_run = bj_now + datetime.timedelta(days=days)
+
+        data = {
+            "job": {
+                "schedule": {
+                    "timezone": "Asia/Shanghai",
+                    "expiresAt": 0,
+                    "hours": [next_run.hour],
+                    "minutes": [next_run.minute],
+                    "mdays": [next_run.day],
+                    "months": [next_run.month],
+                    "wdays": [-1],
+                }
+            }
+        }
+
+        url = f"https://api.cron-job.org/jobs/{job_id}"
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        payload = json.dumps(data).encode("utf-8")
+
+        for attempt in range(3):
+            try:
+                req = urllib.request.Request(
+                    url, data=payload, headers=headers, method="PATCH"
+                )
+                with urllib.request.urlopen(req, timeout=15):
+                    pass
+                log(f"🔁 Cron 写回成功：下次触发 {next_run.year:04d}-{next_run.month:02d}-{next_run.day:02d} {next_run.hour:02d}:{next_run.minute:02d}（北京时间）")
+                return True
+            except Exception as e:
+                log(f"⚠️ Cron 写回第{attempt + 1}次失败：{e}")
+                if attempt < 2:
+                    time.sleep(5)
+        return False
+    except Exception as e:
+        log(f"❌ Cron 写回异常：{e}")
+        return False
+
 
 def handle_cloudflare(page):
     iframe_selector = 'iframe[src*="challenges.cloudflare.com"]'
@@ -373,6 +425,8 @@ def main():
             elif renew_result is False:
                 sys.exit(1)
             else:
+                # 正常续期成功：下一次执行时间 = 当前北京时间 + 7 天
+                update_cronjob_schedule(7)
                 sys.exit(0)
         except Exception as e:
             log(f"❌ 浏览器启动出错: {e}")
