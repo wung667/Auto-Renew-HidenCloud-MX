@@ -150,8 +150,8 @@ def schedule_next_run_before_due(due_date_str):
 
         if today < allowed_date:
             # 在可续期日前：安排到可续期日 00:05（北京时间）
-            # 在可续期日随机安排一个时间，避免固定时间执行
-            random_hour = random.randint(0, 23)
+            # 在可续期日 17:00 以后随机安排执行时间
+            random_hour = random.randint(17, 23)
             random_minute = random.randint(0, 59)
             next_run = datetime.datetime.combine(
                 allowed_date,
@@ -478,9 +478,20 @@ def main():
             elif renew_result is False:
                 sys.exit(1)
             else:
-                # 正常续期成功：下一次执行时间 = 当前北京时间 + 7 天
+                # 正常续期成功：第7天 17:00-23:59 随机执行
                 bj_now = datetime.datetime.utcnow() + datetime.timedelta(hours=8)
-                update_cronjob_schedule(bj_now + datetime.timedelta(days=7))
+                target_date = (bj_now + datetime.timedelta(days=7)).date()
+                random_hour = random.randint(17, 23)
+                random_minute = random.randint(0, 59)
+                next_run = datetime.datetime.combine(
+                    target_date,
+                    datetime.time(hour=random_hour, minute=random_minute)
+                )
+                log(
+                    f"📅 续期成功，Cron 安排至 "
+                    f"{next_run.strftime('%Y-%m-%d %H:%M')}（北京时间）"
+                )
+                update_cronjob_schedule(next_run)
                 sys.exit(0)
         except Exception as e:
             log(f"❌ 浏览器启动出错: {e}")
