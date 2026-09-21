@@ -313,7 +313,7 @@ def get_due_date(page):
         log(f"❌ 获取Due Date失败: {e}")
     return "未知"
 
-def renew_service(page, server_id):
+def renew_service(page, server_id=None):
     try:
         log("➡ 进入续期流程...")
         if page.url != SERVICE_URL:
