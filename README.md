@@ -10,6 +10,7 @@
 | `COOKIE_VALUE`  | ✅必填 | Remenber_web cookie的值,有效期大于1年  |
 | `EMAIL`         | ✅必填 | HidenCloud 邮箱 |
 | `PASSWORD`      | ✅必填 | HidenCloud 密码 |
+| `CRON_JOB`      | ✅必填 | API_KEY,JOB_ID |
 | `NODE_LINK`     | ❌可选 | 代理节点地址,例如:vless:// vmess:// trojan:// hysteria2:// anytls://|
 | `TG_BOT_TOKEN`  | ❌可选 | Telegram Bot Token | 
 | `TG_CHAT_ID`    | ❌可选 | Telegram Chat ID |
