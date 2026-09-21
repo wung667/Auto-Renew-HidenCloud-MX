@@ -323,77 +323,141 @@ def renew_service(page, server_id=None):
 
         # 检查是否有限制提示
         page_text = page.locator("body").inner_text()
-        if "Renewal Restricted" in page_text:
+        if "Renewal Restricted" in page_text or "can only renew" in page_text.lower():
             log("⚠️ 未到续期时间，无法续期。")
             return "NOT_TIME"
 
-        log("🚀 提交后台续费表单...")
-        form_selector = f'form[action*="/service/{server_id}/renew"]'
-        
-        # 直接调用 form.submit()
-        page.evaluate(f"""() => {{
-            const form = document.querySelector('{form_selector}');
-            if (form) {{
-                const daysInput = form.querySelector('select[name="days"], input[name="days"]');
-                if (daysInput) daysInput.value = '7';
-                form.submit();
-            }}
-        }}""")
+        log("🖱️ 准备点击 'Renew' 按钮...")
 
-        # 等待跳转到发票页面
+        # 仅使用真实浏览器点击，不使用 form.submit()
+        renew_btn = page.locator('button:has-text("Renew")').first
+        create_btn = page.locator('button:has-text("Create Invoice")').first
+
+        modal_opened = False
+
+        for i in range(3):
+            try:
+                # 每次尝试前重新确认页面状态
+                handle_cloudflare(page)
+                renew_btn = page.locator('button:has-text("Renew")').first
+                renew_btn.wait_for(state="visible", timeout=10000)
+                renew_btn.scroll_into_view_if_needed()
+                page.wait_for_timeout(500)
+
+                log(f"🖱️ 第 {i + 1} 次尝试点击 'Renew'...")
+
+                # 使用 force click，避免遮挡/可点击区域问题
+                renew_btn.click(force=True)
+
+                # 等待 Modal / Create Invoice
+                log("🖲️ 等待续费弹窗...")
+                try:
+                    create_btn = page.locator('button:has-text("Create Invoice")').first
+                    create_btn.wait_for(state="visible", timeout=5000)
+                    modal_opened = True
+                    log("✅ 续费弹窗已成功弹出！")
+                    break
+                except Exception:
+                    # 再检查一次页面文字，避免把 Renewal Restricted 当成普通点击失败
+                    current_text = page.locator("body").inner_text()
+                    if "Renewal Restricted" in current_text or "can only renew" in current_text.lower():
+                        log("⚠️ 未到续期时间，无法续期。")
+                        return "NOT_TIME"
+
+                    log("⚠️ 弹窗未出现，准备重新加载页面后重试...")
+
+                    # 第1、2次失败时重新进入服务页面，再进行下一次点击
+                    if i < 2:
+                        page.goto(SERVICE_URL, wait_until="domcontentloaded", timeout=60000)
+                        handle_cloudflare(page)
+                        page.wait_for_timeout(1500)
+
+            except Exception as e:
+                log(f"❌ 第 {i + 1} 次点击 Renew 出错: {e}")
+                if i < 2:
+                    try:
+                        page.goto(SERVICE_URL, wait_until="domcontentloaded", timeout=60000)
+                        handle_cloudflare(page)
+                        page.wait_for_timeout(1500)
+                    except Exception as reload_error:
+                        log(f"⚠️ 重载续费页面失败: {reload_error}")
+
+        if not modal_opened:
+            log("❌ 错误：3次尝试后，续费弹窗仍未出现。")
+            page.screenshot(path="renew_modal_failed.png")
+
+            # 连续3次失败：10分钟后重新执行
+            bj_now = datetime.datetime.utcnow() + datetime.timedelta(hours=8)
+            retry_time = bj_now + datetime.timedelta(minutes=10)
+            log(
+                f"⏰ 连续3次续费尝试失败，Cron 将在10分钟后重试："
+                f"{retry_time.strftime('%Y-%m-%d %H:%M')}（北京时间）"
+            )
+            update_cronjob_schedule(retry_time)
+
+            # 立即推送 Telegram
+            send_telegram_notification(
+                "❌ 续期失败：连续3次尝试均未打开续费弹窗，已安排10分钟后重试",
+                getattr(sys.modules[__name__], "_CURRENT_OLD_DUE", "未知"),
+                getattr(sys.modules[__name__], "_CURRENT_OLD_DUE", "未知")
+            )
+            return "RETRY_10M"
+
+        handle_cloudflare(page)
+
+        # 真正点击 Create Invoice
+        log("🖱️ 点击 'Create Invoice'...")
+        create_btn = page.locator('button:has-text("Create Invoice"):visible').first
+        create_btn.wait_for(state="visible", timeout=10000)
+        create_btn.scroll_into_view_if_needed()
+        page.wait_for_timeout(500)
+        create_btn.click(force=True)
+
+        # 等待 Invoice 页面
         new_invoice_url = None
         start_wait = time.time()
-        while time.time() - start_wait < 60:
+        while time.time() - start_wait < 90:
             if "/payment/invoice/" in page.url:
                 new_invoice_url = page.url
-                log(f"🎉 页面已跳转至发票页: {new_invoice_url}")
+                log(f"🎉 页面已跳转: {new_invoice_url}")
                 break
+
             if page.locator('iframe[src*="challenges.cloudflare.com"]').count() > 0:
+                log("⚠️ 遇到 Cloudflare 验证，尝试处理...")
                 handle_cloudflare(page)
+
             time.sleep(1)
 
-        # 备选：如果直接 submit 未跳转，强制展示 modal 并点击
         if not new_invoice_url:
-            page.evaluate(f"""() => {{
-                const modal = document.getElementById('renewService-{server_id}');
-                if (modal) {{
-                    modal.classList.remove('hidden');
-                    modal.style.display = 'block';
-                }}
-            }}""")
-            page.wait_for_timeout(1000)
-            create_btn = page.locator(f'#renewService-{server_id} button[type="submit"]')
-            if create_btn.count() > 0:
-                create_btn.first.click(force=True)
-                start_wait = time.time()
-                while time.time() - start_wait < 60:
-                    if "/payment/invoice/" in page.url:
-                        new_invoice_url = page.url
-                        log(f"🎉 页面已跳转至发票页: {new_invoice_url}")
-                        break
-                    time.sleep(1)
-
-        if not new_invoice_url:
-            log("❌ 未能成功进入发票页面。")
-            page.screenshot(path="renew_submit_failed.png")
+            log("❌ 未能进入发票页面，超时。")
+            page.screenshot(path="renew_stuck_invoice.png")
             return False
 
-        # 支付账单
+        # 支付
+        if page.url != new_invoice_url:
+            page.goto(new_invoice_url, wait_until="domcontentloaded", timeout=60000)
         handle_cloudflare(page)
-        pay_btn = page.locator('button:has-text("Pay"), a:has-text("Pay"):visible').first
-        pay_btn.wait_for(state="visible", timeout=30000)
-        pay_btn.click(force=True)
-        log("✅ 'Pay' 按钮已点击！")
 
-        time.sleep(6)
+        log("🔎 查找 'Pay' 按钮...")
+        pay_btn = page.locator(
+            'a:has-text("Pay"):visible, button:has-text("Pay"):visible'
+        ).first
+        pay_btn.wait_for(state="visible", timeout=30000)
+        pay_btn.scroll_into_view_if_needed()
+        pay_btn.click(force=True)
+        log("✅ 'Pay' 按钮已点击。")
+
+        time.sleep(5)
+
         page.goto(SERVICE_URL, wait_until="domcontentloaded", timeout=60000)
         handle_cloudflare(page)
         return True
 
     except Exception as e:
-        log(f"❌ 续费过程异常: {e}")
+        log(f"❌ 续费异常: {e}")
         page.screenshot(path="renew_error.png")
         return False
+
 
 def main():
     # 检查必要环境变量
