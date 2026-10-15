@@ -635,6 +635,75 @@ def solve_turnstile(page, timeout=120, success_check=None,
         pass
     return False
 
+# ===== Invoice / Login session diagnostics =====
+_REQUEST_LOG = []
+_MAX_REQUEST_LOG = 250
+
+def _short_url(url, max_len=220):
+    try:
+        from urllib.parse import urlsplit
+        u = urlsplit(url)
+        return f"{u.scheme}://{u.netloc}{u.path}"[:max_len]
+    except Exception:
+        return str(url)[:max_len]
+
+def _interesting_url(url):
+    u = (url or '').lower()
+    return any(k in u for k in ('/renew','/payment/','/invoice','/auth/login','/login','challenge-platform','challenges.cloudflare.com','/service/','csrf','logout'))
+
+def attach_network_debug(page):
+    def on_request(req):
+        try:
+            if not _interesting_url(req.url): return
+            rec={'kind':'REQ','ts':time.strftime('%H:%M:%S'),'method':req.method,'url':_short_url(req.url),'resource':req.resource_type}
+            _REQUEST_LOG.append(rec)
+            if len(_REQUEST_LOG)>_MAX_REQUEST_LOG: del _REQUEST_LOG[:-_MAX_REQUEST_LOG]
+            log(f"🌐 [REQ] {req.method} {req.resource_type} {_short_url(req.url)}")
+        except Exception: pass
+    def on_response(resp):
+        try:
+            if not _interesting_url(resp.url): return
+            location=(resp.headers or {}).get('location','')
+            rec={'kind':'RESP','ts':time.strftime('%H:%M:%S'),'status':resp.status,'url':_short_url(resp.url),'location':_short_url(location) if location else ''}
+            _REQUEST_LOG.append(rec)
+            if len(_REQUEST_LOG)>_MAX_REQUEST_LOG: del _REQUEST_LOG[:-_MAX_REQUEST_LOG]
+            if location:
+                log(f"🌐 [RESP] {resp.status} {_short_url(resp.url)} -> Location: {_short_url(location)}")
+            else:
+                log(f"🌐 [RESP] {resp.status} {_short_url(resp.url)}")
+        except Exception: pass
+    page.on('request',on_request)
+    page.on('response',on_response)
+
+def cookie_snapshot(context):
+    try:
+        cookies=context.cookies([BASE_URL])
+        return {c.get('name'):{k:c.get(k) for k in ('domain','path','httpOnly','secure','sameSite','expires')} for c in cookies}
+    except Exception as e:
+        log(f"⚠️ Cookie 快照失败: {e}")
+        return {}
+
+def log_cookie_diff(before, after, label='Cookie'):
+    b=set(before or {}); a=set(after or {})
+    added=sorted(a-b); removed=sorted(b-a)
+    changed=sorted(k for k in a&b if before.get(k)!=after.get(k))
+    log(f"🍪 {label}: 新增={added or '无'}, 删除={removed or '无'}, 属性变化={changed or '无'}")
+
+def save_login_diagnostics(page, context, prefix='invoice_login_redirect'):
+    try: page.screenshot(path=f'{prefix}.png', full_page=True)
+    except Exception: pass
+    try: Path(f'{prefix}.html').write_text(page.content(),encoding='utf-8')
+    except Exception: pass
+    try:
+        with open(f'{prefix}_network.txt','w',encoding='utf-8') as f:
+            f.write(f'URL: {page.url}\nTitle: {page.title()}\n')
+            f.write('--- interesting requests/responses ---\n')
+            for rec in _REQUEST_LOG[-150:]: f.write(repr(rec)+'\n')
+            f.write('--- cookies (names only) ---\n')
+            for name,meta in cookie_snapshot(context).items(): f.write(f'{name}: {meta}\n')
+        log(f"📦 已保存诊断: {prefix}.png / {prefix}.html / {prefix}_network.txt")
+    except Exception as e: log(f"⚠️ 保存诊断失败: {e}")
+
 def login(page):
     # 始终使用账号密码登录，不再使用 Cookie 登录或 Cookie 写回。
     if not EMAIL or not PASSWORD:
@@ -827,6 +896,7 @@ def renew_service(page):
             if "/auth/login" in current:
                 log("❌ Create Invoice 后被重定向到 Login！")
                 log_cookie_diff(before_cookies,cookie_snapshot(page.context),"Create Invoice 前后 Cookie")
+                save_login_diagnostics(page,page.context,"invoice_login_redirect")
                 return False
             if time.time()-last_cookie>=3:
                 log_cookie_diff(before_cookies,cookie_snapshot(page.context),"Create Invoice Cookie"); last_cookie=time.time()
@@ -842,11 +912,11 @@ def renew_service(page):
             log("❌ 120 秒内未进入 Invoice 页面")
             log(f"🔎 最终 URL: {page.url}"); log(f"🔎 最终 Title: {page.title()!r}")
             log_cookie_diff(before_cookies,cookie_snapshot(page.context),"最终 Cookie")
-            try:
-                page.screenshot(path="renew_stuck_invoice.png",full_page=True)
-                Path("renew_stuck_invoice.html").write_text(page.content(),encoding="utf-8")
-            except Exception:
-                pass
+            if "/auth/login" in page.url: save_login_diagnostics(page,page.context,"invoice_login_timeout")
+            else:
+                try:
+                    page.screenshot(path="renew_stuck_invoice.png",full_page=True); Path("renew_stuck_invoice.html").write_text(page.content(),encoding="utf-8")
+                except Exception: pass
             return False
 
         if page.url!=new_invoice_url: page.goto(new_invoice_url,wait_until="domcontentloaded",timeout=60000)
@@ -901,6 +971,8 @@ def main():
             )
             page = context.new_page()
             page.add_init_script(STEALTH_JS)
+            attach_network_debug(page)
+            log("🔎 已启用 Create Invoice / Login 网络诊断")
 
             if not login(page):
                 sys.exit(1)
