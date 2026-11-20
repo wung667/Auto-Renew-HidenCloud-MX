@@ -84,11 +84,31 @@ jobs:
           fi
 
           echo "[INFO] 执行远端 sing-box 代理脚本..."
-          bash /tmp/setup_proxy.sh
-          proxy_status=$?
+          max_attempts=3
+          retry_delay=10
+          proxy_status=1
+
+          for attempt in $(seq 1 "$max_attempts"); do
+            echo "[INFO] sing-box 代理初始化：第 ${attempt}/${max_attempts} 次尝试"
+
+            bash /tmp/setup_proxy.sh
+            proxy_status=$?
+
+            if [ "$proxy_status" -eq 0 ]; then
+              echo "[INFO] setup_proxy.sh 执行成功"
+              break
+            fi
+
+            echo "[WARN] setup_proxy.sh 执行失败，退出码：${proxy_status}"
+
+            if [ "$attempt" -lt "$max_attempts" ]; then
+              echo "[INFO] ${retry_delay} 秒后重试..."
+              sleep "$retry_delay"
+            fi
+          done
 
           if [ "$proxy_status" -ne 0 ]; then
-            notify_proxy_failure "setup_proxy.sh 执行失败，退出码：${proxy_status}"
+            notify_proxy_failure "setup_proxy.sh 连续 ${max_attempts} 次执行失败，最后退出码：${proxy_status}"
             exit 1
           fi
 
