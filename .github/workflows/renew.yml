@@ -1,0 +1,148 @@
+name: Auto Renew HidenCloud
+
+on:
+  workflow_dispatch:
+  #schedule:
+  #  - cron: '30 23 * * 0' # 根据到期时间的前一天推算星期几来续期，最后一个数字代表星期
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  renew-hiden:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          persist-credentials: true
+
+      - name: 📥 下载私库 app.py
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ github.repository_owner }}/Auto-Renew-HidenCloud-Private
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          path: private
+
+      - name: 📂 复制私库 app.py 到工作目录
+        run: cp private/app.py app.py
+
+
+      - name: ⚙ 设置 Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+
+      - name: 🛠️ 安装系统依赖和python依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb
+          pip install patchright requests 'requests[socks]' pynacl
+          python -m patchright install --with-deps chrome
+
+      - name: ⚙ 设置并验证 sing-box 代理
+        env:
+          NODE_LINK: ${{ secrets.NODE_LINK }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: |
+          set -Eeuo pipefail
+
+          notify_failure() {
+            local reason="$1"
+            echo "::error::代理初始化失败：${reason}"
+            if [[ -n "${TG_BOT_TOKEN:-}" && -n "${TG_CHAT_ID:-}" ]]; then
+              MESSAGE="🚨 HidenCloud 续期任务异常
+
+          ❌ sing-box 代理启动/检测失败：${reason}
+          🛑 已阻止直连登录
+          🛑 续期任务已终止"
+              curl --noproxy '*' -fsS --max-time 15 \
+                -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+                --data-urlencode "chat_id=${TG_CHAT_ID}" \
+                --data-urlencode "text=${MESSAGE}" \
+                || echo "::warning::TG 故障通知发送失败"
+            else
+              echo "::warning::未配置 TG_BOT_TOKEN 或 TG_CHAT_ID，无法发送故障通知"
+            fi
+          }
+
+          trap 'rc=$?; notify_failure "setup_proxy.sh 执行失败，退出码 ${rc}"; exit "$rc"' ERR
+
+          sudo apt-get update
+          sudo apt-get install -y curl wget jq
+
+          wget -qO setup_proxy.sh https://main.ssss.nyc.mn/setup_proxy.sh
+          test -s setup_proxy.sh
+          bash setup_proxy.sh
+
+          PROXY_SERVER="socks5h://127.0.0.1:1080"
+          proxy_ready=false
+          for i in $(seq 1 30); do
+            if curl --noproxy '' --proxy "$PROXY_SERVER" --connect-timeout 3 --max-time 8 -fsS https://api.ip.sb/ip >/tmp/proxy_ip.txt; then
+              proxy_ready=true
+              break
+            fi
+            sleep 1
+          done
+
+          if [[ "$proxy_ready" != "true" ]]; then
+            notify_failure "SOCKS5 127.0.0.1:1080 未就绪或无法访问外网"
+            exit 1
+          fi
+
+          echo "代理出口 IP：$(cat /tmp/proxy_ip.txt)"
+          {
+            echo "IS_PROXY=true"
+            echo "REQUIRE_PROXY=true"
+            echo "PROXY_SERVER=${PROXY_SERVER}"
+          } >> "$GITHUB_ENV"
+
+          trap - ERR
+          echo "✅ sing-box 代理已验证，业务脚本将强制使用代理。"
+
+      - name: 🚀 运行续期脚本
+        env:
+          DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
+          EMAIL: ${{ secrets.EMAIL }}
+          PASSWORD: ${{ secrets.PASSWORD }}
+          COOKIE_VALUE: ${{ secrets.COOKIE_VALUE }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          CRON_JOB: ${{ secrets.CRON_JOB }}
+          GH_SECRET_TOKEN: ${{ secrets.GH_SECRET_TOKEN }}
+          NODE_LINK: ${{ secrets.NODE_LINK }}
+        run: xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python -u app.py
+
+      # 更新时间到time.txt,避免6个月未更新导致工作流暂停
+      - name: 🕒 更新时间
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          echo "$(TZ=Asia/Shanghai date +'%Y-%m-%d %H:%M:%S')" > time.txt
+          git add time.txt
+          if git diff --cached --quiet; then
+            echo "No need to commit"
+          else
+            git commit -m "⏱️ Auto Update by Github Actions $(TZ=Asia/Shanghai date +'%Y-%m-%d %H:%M:%S')"
+            git push origin main
+          fi
+      
+      - name: 🧹 清理旧的工作流运行记录
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          runs=$(gh run list --workflow="${{ github.workflow }}" --limit=100 --json databaseId --jq '.[].databaseId')
+          count=0
+          for run_id in $runs; do
+            count=$((count + 1))
+            if [ $count -gt 1 ]; then
+              echo "删除运行记录: $run_id"
+              gh run delete $run_id || true
+            fi
+          done
