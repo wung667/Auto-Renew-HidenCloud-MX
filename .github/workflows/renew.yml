@@ -1,0 +1,144 @@
+name: Auto Renew HidenCloud
+
+on:
+  workflow_dispatch:
+  #schedule:
+  #  - cron: '30 23 * * 0' # 根据到期时间的前一天推算星期几来续期，最后一个数字代表星期
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  renew-hiden:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          persist-credentials: true
+
+      - name: 📥 下载私库 app.py
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ github.repository_owner }}/Auto-Renew-HidenCloud-Private
+          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
+          path: private
+
+      - name: 📂 复制私库 app.py 到工作目录
+        run: cp private/app.py app.py
+
+
+      - name: ⚙ 设置 Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+
+      - name: 🛠️ 安装系统依赖和python依赖
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb curl wget
+          pip install patchright requests 'requests[socks]' pynacl
+          python -m patchright install --with-deps chrome
+
+      - name: ⚙ 设置sing-box代理
+        env:
+          NODE_LINK: ${{ secrets.NODE_LINK }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+        run: |
+          set +e
+
+          notify_proxy_failure() {
+            local reason="$1"
+            echo "❌ 代理初始化失败：${reason}"
+
+            if [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ]; then
+              curl --noproxy '*' -sS --max-time 15 \
+                -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+                --data-urlencode "chat_id=${TG_CHAT_ID}" \
+                --data-urlencode "text=🚨 HidenCloud 自动续期失败
+
+          原因：sing-box 代理初始化失败
+          详情：${reason}
+
+          已中断工作流，未执行续期操作。" \
+                >/dev/null || echo "⚠️ Telegram 故障通知发送失败"
+            else
+              echo "⚠️ 未配置 TG_BOT_TOKEN 或 TG_CHAT_ID，无法发送通知"
+            fi
+          }
+
+          if [ -z "$NODE_LINK" ]; then
+            notify_proxy_failure "NODE_LINK 未配置"
+            exit 1
+          fi
+
+          echo "[INFO] 下载远端 sing-box 代理脚本..."
+          if ! wget -qO /tmp/setup_proxy.sh https://main.ssss.nyc.mn/setup_proxy.sh; then
+            notify_proxy_failure "下载 setup_proxy.sh 失败"
+            exit 1
+          fi
+
+          echo "[INFO] 执行远端 sing-box 代理脚本..."
+          bash /tmp/setup_proxy.sh
+          proxy_status=$?
+
+          if [ "$proxy_status" -ne 0 ]; then
+            notify_proxy_failure "setup_proxy.sh 执行失败，退出码：${proxy_status}"
+            exit 1
+          fi
+
+          # 确认远端脚本已将代理成功标记写入 GitHub Actions 环境
+          if ! grep -q '^IS_PROXY=true$' "$GITHUB_ENV" || \
+             ! grep -Eq '^PROXY_SERVER=.+$' "$GITHUB_ENV"; then
+            notify_proxy_failure "脚本未写入有效的 IS_PROXY=true 和 PROXY_SERVER，代理未确认启用"
+            exit 1
+          fi
+
+          echo "✅ sing-box 代理初始化成功，允许继续执行续期脚本"
+
+      - name: 🚀 运行续期脚本
+        env:
+          DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
+          EMAIL: ${{ secrets.EMAIL }}
+          PASSWORD: ${{ secrets.PASSWORD }}
+          COOKIE_VALUE: ${{ secrets.COOKIE_VALUE }}
+          TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
+          TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          CRON_JOB: ${{ secrets.CRON_JOB }}
+          GH_SECRET_TOKEN: ${{ secrets.GH_SECRET_TOKEN }}
+          NODE_LINK: ${{ secrets.NODE_LINK }}
+        run: xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python -u app.py
+
+      # 更新时间到time.txt,避免6个月未更新导致工作流暂停
+      - name: 🕒 更新时间
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          echo "$(TZ=Asia/Shanghai date +'%Y-%m-%d %H:%M:%S')" > time.txt
+          git add time.txt
+          if git diff --cached --quiet; then
+            echo "No need to commit"
+          else
+            git commit -m "⏱️ Auto Update by Github Actions $(TZ=Asia/Shanghai date +'%Y-%m-%d %H:%M:%S')"
+            git push origin main
+          fi
+      
+      - name: 🧹 清理旧的工作流运行记录
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          runs=$(gh run list --workflow="${{ github.workflow }}" --limit=100 --json databaseId --jq '.[].databaseId')
+          count=0
+          for run_id in $runs; do
+            count=$((count + 1))
+            if [ $count -gt 1 ]; then
+              echo "删除运行记录: $run_id"
+              gh run delete $run_id || true
+            fi
+          done
